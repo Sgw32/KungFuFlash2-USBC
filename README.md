@@ -98,6 +98,10 @@ This means, however, that the EasyFlash 3 program on the PC side must be modifie
 The repository of the original Kung Fu Flash contains a modified version of [EasyFlash 3 USB Utilities](https://github.com/KimJorgensen/KungFuFlash/tree/master/3rd_party/ef3utils)
 and [EasyFlash 3 BBS](https://github.com/KimJorgensen/KungFuFlash/tree/master/3rd_party/ef3bbs) which will also work with the Kung Fu Flash 2.
 
+### SD Card Reader
+
+When the *Card Reader* option is selected in the launcher, the SD card is exposed to the host computer as a standard USB mass storage device.
+
 ## Firmware Update
 
 Just place the KungFuFlash_v2.xx.upd file on the SD card and select the file in the launcher to initiate the firmware update.

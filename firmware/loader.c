@@ -16,7 +16,10 @@
  * 2. Altered source versions must be plainly marked as such, and must not be
  *    misrepresented as being the original software.
  * 3. This notice may not be removed or altered from any source distribution.
- */
+*/
+#include "common.h"
+
+void usb_msc_init(void);
 
 #define CFG_FILENAME "/.KFF2.cfg"
 
@@ -917,6 +920,14 @@ static bool c64_set_mode(void)
         {
             c64_ef3_enable();
             basic_loading("FROM USB");
+            result = true;
+        }
+        break;
+
+        case CFG_READER:
+        {
+            usb_msc_init();
+            basic_loading("CARD READER");
             result = true;
         }
         break;
