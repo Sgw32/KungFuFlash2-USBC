@@ -33,6 +33,8 @@
 #include "usbd_core.c"
 #include "usbd_stm32h7b0_otghs.c"
 
+static void usb_disable(void);
+
 #define CDC_EP0_SIZE    0x08
 #define CDC_RXD_EP      0x01
 #define CDC_TXD_EP      0x81
@@ -353,6 +355,270 @@ static void cdc_init_usbd(void) {
     usbd_reg_config(&udev, cdc_setconf);
     usbd_reg_control(&udev, cdc_control);
     usbd_reg_descr(&udev, cdc_getdesc);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Mass storage support                                                  */
+
+#define MSC_EP0_SIZE 0x40
+#define MSC_OUT_EP   0x01
+#define MSC_IN_EP    0x81
+#define MSC_EP_SIZE  0x40
+#define CBW_SIGNATURE 0x43425355
+#define CSW_SIGNATURE 0x53425355
+
+struct msc_cbw {
+    u32 signature;
+    u32 tag;
+    u32 data_len;
+    u8  flags;
+    u8  lun;
+    u8  cb_len;
+    u8  cb[16];
+} __attribute__((packed));
+
+struct msc_csw {
+    u32 signature;
+    u32 tag;
+    u32 residue;
+    u8  status;
+} __attribute__((packed));
+
+struct msc_config {
+    struct usb_config_descriptor config;
+    struct usb_interface_descriptor msc;
+    struct usb_endpoint_descriptor ep_out;
+    struct usb_endpoint_descriptor ep_in;
+} __attribute__((packed));
+
+static const struct usb_device_descriptor msc_device_desc = {
+    .bLength            = sizeof(struct usb_device_descriptor),
+    .bDescriptorType    = USB_DTYPE_DEVICE,
+    .bcdUSB             = VERSION_BCD(2,0,0),
+    .bDeviceClass       = USB_CLASS_IAD,
+    .bDeviceSubClass    = USB_SUBCLASS_IAD,
+    .bDeviceProtocol    = USB_PROTO_IAD,
+    .bMaxPacketSize0    = MSC_EP0_SIZE,
+    .idVendor           = 0x0483,
+    .idProduct          = 0x5741,
+    .bcdDevice          = VERSION_BCD(1,0,0),
+    .iManufacturer      = 1,
+    .iProduct           = 2,
+    .iSerialNumber      = INTSERIALNO_DESCRIPTOR,
+    .bNumConfigurations = 1,
+};
+
+static const struct msc_config msc_config_desc = {
+    .config = {
+        .bLength            = sizeof(struct usb_config_descriptor),
+        .bDescriptorType    = USB_DTYPE_CONFIGURATION,
+        .wTotalLength       = sizeof(struct msc_config),
+        .bNumInterfaces     = 1,
+        .bConfigurationValue= 1,
+        .iConfiguration     = NO_DESCRIPTOR,
+        .bmAttributes       = USB_CFG_ATTR_RESERVED | USB_CFG_ATTR_SELFPOWERED,
+        .bMaxPower          = USB_CFG_POWER_MA(100),
+    },
+    .msc = {
+        .bLength            = sizeof(struct usb_interface_descriptor),
+        .bDescriptorType    = USB_DTYPE_INTERFACE,
+        .bInterfaceNumber   = 0,
+        .bAlternateSetting  = 0,
+        .bNumEndpoints      = 2,
+        .bInterfaceClass    = USB_CLASS_MASS_STORAGE,
+        .bInterfaceSubClass = 0x06,
+        .bInterfaceProtocol = 0x50,
+        .iInterface         = NO_DESCRIPTOR,
+    },
+    .ep_out = {
+        .bLength            = sizeof(struct usb_endpoint_descriptor),
+        .bDescriptorType    = USB_DTYPE_ENDPOINT,
+        .bEndpointAddress   = MSC_OUT_EP,
+        .bmAttributes       = USB_EPTYPE_BULK,
+        .wMaxPacketSize     = MSC_EP_SIZE,
+        .bInterval          = 0x00,
+    },
+    .ep_in = {
+        .bLength            = sizeof(struct usb_endpoint_descriptor),
+        .bDescriptorType    = USB_DTYPE_ENDPOINT,
+        .bEndpointAddress   = MSC_IN_EP,
+        .bmAttributes       = USB_EPTYPE_BULK,
+        .wMaxPacketSize     = MSC_EP_SIZE,
+        .bInterval          = 0x00,
+    },
+};
+
+static const struct usb_string_descriptor msc_lang_desc     = USB_ARRAY_DESC(USB_LANGID_ENG_US);
+static const struct usb_string_descriptor msc_manuf_desc_en = USB_STRING_DESC("KFF2");
+static const struct usb_string_descriptor msc_prod_desc_en  = USB_STRING_DESC("SD Card Reader");
+static const struct usb_string_descriptor *const msc_dtable[] = {
+    &msc_lang_desc,
+    &msc_manuf_desc_en,
+    &msc_prod_desc_en,
+};
+
+static struct msc_cbw msc_cbw;
+static struct msc_csw msc_csw;
+static u8 msc_buf[512];
+
+static usbd_respond msc_getdesc(usbd_ctlreq *req, void **address, u16 *length) {
+    const u8 dtype = req->wValue >> 8;
+    const u8 dnumber = req->wValue & 0xFF;
+    const void* desc;
+    u16 len = 0;
+    switch (dtype) {
+    case USB_DTYPE_DEVICE:
+        desc = &msc_device_desc;
+        break;
+    case USB_DTYPE_CONFIGURATION:
+        desc = &msc_config_desc;
+        len = sizeof(msc_config_desc);
+        break;
+    case USB_DTYPE_STRING:
+        if (dnumber < 3) {
+            desc = msc_dtable[dnumber];
+        } else {
+            return usbd_fail;
+        }
+        break;
+    default:
+        return usbd_fail;
+    }
+    if (len == 0) {
+        len = ((struct usb_header_descriptor*)desc)->bLength;
+    }
+    *address = (void*)desc;
+    *length = len;
+    return usbd_ack;
+}
+
+static void msc_send_csw(usbd_device *dev, u8 status) {
+    msc_csw.signature = CSW_SIGNATURE;
+    msc_csw.status = status;
+    usbd_ep_write(dev, MSC_IN_EP, &msc_csw, sizeof(msc_csw));
+}
+
+static void msc_scsi_inquiry(usbd_device *dev) {
+    static const u8 resp[36] = {
+        0x00, 0x80, 0x02, 0x02, 36-4, 0, 0, 0,
+        'K','F','F','2',' ',' ',' ',' ',
+        'M','S','C',' ','D','E','V',' ',' ',
+        '1','.','0','0'
+    };
+    usbd_ep_write(dev, MSC_IN_EP, resp, sizeof(resp));
+    msc_send_csw(dev, 0);
+}
+
+static void msc_scsi_capacity(usbd_device *dev) {
+    DWORD count = 0;
+    disk_ioctl(0, GET_SECTOR_COUNT, &count);
+    u32 lba = __builtin_bswap32(count - 1);
+    u32 blksz = __builtin_bswap32(512);
+    msc_buf[0] = (lba >> 24) & 0xFF;
+    msc_buf[1] = (lba >> 16) & 0xFF;
+    msc_buf[2] = (lba >> 8) & 0xFF;
+    msc_buf[3] = lba & 0xFF;
+    msc_buf[4] = (blksz >> 24) & 0xFF;
+    msc_buf[5] = (blksz >> 16) & 0xFF;
+    msc_buf[6] = (blksz >> 8) & 0xFF;
+    msc_buf[7] = blksz & 0xFF;
+    usbd_ep_write(dev, MSC_IN_EP, msc_buf, 8);
+    msc_send_csw(dev, 0);
+}
+
+static void msc_scsi_read10(usbd_device *dev, u32 lba, u16 blocks) {
+    for (u16 i=0; i<blocks; i++) {
+        disk_read(0, msc_buf, lba+i, 1);
+        usbd_ep_write(dev, MSC_IN_EP, msc_buf, 512);
+    }
+    msc_send_csw(dev, 0);
+}
+
+static void msc_scsi_write10(usbd_device *dev, u32 lba, u16 blocks) {
+    for (u16 i=0; i<blocks; i++) {
+        while (usbd_ep_read(dev, MSC_OUT_EP, msc_buf, 512) != 512);
+        disk_write(0, msc_buf, lba+i, 1);
+    }
+    msc_send_csw(dev, 0);
+}
+
+static void msc_handle_cbw(usbd_device *dev) {
+    u8 opcode = msc_cbw.cb[0];
+    switch (opcode) {
+    case 0x12:
+        msc_scsi_inquiry(dev);
+        break;
+    case 0x03:
+        memset(msc_buf, 0, 18);
+        msc_buf[0] = 0x70;
+        usbd_ep_write(dev, MSC_IN_EP, msc_buf, 18);
+        msc_send_csw(dev, 0);
+        break;
+    case 0x25:
+        msc_scsi_capacity(dev);
+        break;
+    case 0x28:
+    {
+        u32 lba = (msc_cbw.cb[2]<<24) | (msc_cbw.cb[3]<<16) | (msc_cbw.cb[4]<<8) | msc_cbw.cb[5];
+        u16 blocks = (msc_cbw.cb[7]<<8) | msc_cbw.cb[8];
+        msc_scsi_read10(dev, lba, blocks);
+        break;
+    }
+    case 0x2A:
+    {
+        u32 lba = (msc_cbw.cb[2]<<24) | (msc_cbw.cb[3]<<16) | (msc_cbw.cb[4]<<8) | msc_cbw.cb[5];
+        u16 blocks = (msc_cbw.cb[7]<<8) | msc_cbw.cb[8];
+        msc_scsi_write10(dev, lba, blocks);
+        break;
+    }
+    case 0x00:
+        msc_send_csw(dev, 0);
+        break;
+    default:
+        msc_send_csw(dev, 1);
+        break;
+    }
+}
+
+static void msc_rx(usbd_device *dev, u8 event, u8 ep) {
+    if (event == usbd_evt_eprx) {
+        int len = usbd_ep_read(dev, ep, &msc_cbw, sizeof(msc_cbw));
+        if (len == sizeof(msc_cbw) && msc_cbw.signature == CBW_SIGNATURE) {
+            msc_handle_cbw(dev);
+        }
+    }
+}
+
+static usbd_respond msc_setconf(usbd_device *dev, u8 cfg) {
+    switch (cfg) {
+    case 0:
+        usbd_ep_deconfig(dev, MSC_OUT_EP);
+        usbd_ep_deconfig(dev, MSC_IN_EP);
+        usbd_reg_endpoint(dev, MSC_OUT_EP, 0);
+        return usbd_ack;
+    case 1:
+        usbd_ep_config(dev, MSC_OUT_EP, USB_EPTYPE_BULK, MSC_EP_SIZE);
+        usbd_ep_config(dev, MSC_IN_EP,  USB_EPTYPE_BULK, MSC_EP_SIZE);
+        usbd_reg_endpoint(dev, MSC_OUT_EP, msc_rx);
+        return usbd_ack;
+    default:
+        return usbd_fail;
+    }
+}
+
+static void msc_init_usbd(void) {
+    usbd_init(&udev, &usbd_hw, MSC_EP0_SIZE, ubuf, sizeof(ubuf));
+    usbd_reg_config(&udev, msc_setconf);
+    usbd_reg_descr(&udev, msc_getdesc);
+}
+
+void usb_msc_init(void) {
+    usb_disable();
+    msc_init_usbd();
+    NVIC_SetPriority(OTG_HS_IRQn, 0x07);
+    NVIC_EnableIRQ(OTG_HS_IRQn);
+    usbd_enable(&udev, true);
+    usbd_connect(&udev, true);
 }
 
 void OTG_HS_IRQHandler(void)

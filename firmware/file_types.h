@@ -207,6 +207,7 @@ typedef enum
     CFG_CRT,
     CFG_PRG,
     CFG_USB,
+    CFG_READER,
     CFG_DISK,
     CFG_TXT,
     CFG_BASIC,
